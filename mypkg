@@ -5,6 +5,7 @@
 
 set -eu
 
+[ -f "/etc/mypkg/mypkg.conf" ] && . "/etc/mypkg/mypkg.conf"
 ### Configurações globais
 MYPKG_ROOT="${MYPKG_ROOT:-/}"
 MYPKG_DB_DIR="${MYPKG_DB_DIR:-/var/lib/mypkg/db}"
