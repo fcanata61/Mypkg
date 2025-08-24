@@ -18,7 +18,3 @@ Ele permite baixar, compilar, instalar e gerenciar pacotes de forma automática,
 - Clean de diretório de trabalho
 - Destdir e fakeroot
 - Flags coloridas, spinner, help
-
----
-
-## Estrutura de diretórios
