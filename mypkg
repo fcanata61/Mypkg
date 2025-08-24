@@ -1,0 +1,754 @@
+#!/bin/sh
+# mypkg - gerenciador de pacotes source-based (POSIX sh)
+# Autor: Fernando Canatta (projeto pessoal)
+# Licença: GPL-3.0-or-later
+
+set -eu
+
+### Configurações globais
+MYPKG_ROOT="${MYPKG_ROOT:-/}"
+MYPKG_DB_DIR="${MYPKG_DB_DIR:-/var/lib/mypkg/db}"
+MYPKG_CACHE_SRC="${MYPKG_CACHE_SRC:-/var/lib/mypkg/cache/src}"
+MYPKG_CACHE_PKG="${MYPKG_CACHE_PKG:-/var/lib/mypkg/cache/pkg}"
+MYPKG_BUILD_DIR="${MYPKG_BUILD_DIR:-/var/lib/mypkg/build}"
+MYPKG_LOG_DIR="${MYPKG_LOG_DIR:-/var/log/mypkg}"
+MYPKG_STATE_DIR="${MYPKG_STATE_DIR:-/var/lib/mypkg/state}"
+MYPKG_ETC="${MYPKG_ETC:-/etc/mypkg}"
+
+UPGRADE_POLICY="${UPGRADE_POLICY:-major-only}"
+
+# ferramentas padrão (substituíveis via env)
+CMD_CURL="${CMD_CURL:-curl -L -o}"
+CMD_WGET="${CMD_WGET:-wget -O}"
+CMD_GIT="${CMD_GIT:-git}"
+CMD_SHA256SUM="${CMD_SHA256SUM:-sha256sum}"
+
+### Cores (se --color for ativado)
+color_red()   { [ "${COLOR:-auto}" != "never" ] && printf '\033[31m%s\033[0m' "$*"; }
+color_green() { [ "${COLOR:-auto}" != "never" ] && printf '\033[32m%s\033[0m' "$*"; }
+color_yellow(){ [ "${COLOR:-auto}" != "never" ] && printf '\033[33m%s\033[0m' "$*"; }
+color_blue()  { [ "${COLOR:-auto}" != "never" ] && printf '\033[34m%s\033[0m' "$*"; }
+
+### Utilitários
+log()   { printf '%s\n' "$*"; }
+info()  { color_blue "[INFO] "; printf '%s\n' "$*"; }
+warn()  { color_yellow "[WARN] "; printf '%s\n' "$*"; }
+error() { color_red "[ERRO] "; printf '%s\n' "$*" >&2; exit 1; }
+
+### Spinner (simplificado)
+spinner() {
+    [ "${SPINNER:-0}" -eq 0 ] && return
+    while :; do
+        for c in '|' '/' '-' '\\'; do
+            printf "\\r%s" "$c"
+            sleep 0.1
+        done
+    done
+}
+
+### Checa e cria diretórios necessários
+init_dirs() {
+    for d in "$MYPKG_DB_DIR" "$MYPKG_CACHE_SRC" "$MYPKG_CACHE_PKG" \
+             "$MYPKG_BUILD_DIR" "$MYPKG_LOG_DIR" "$MYPKG_STATE_DIR"; do
+        [ -d "$d" ] || mkdir -p "$d"
+    done
+}
+
+### Ajuda geral
+usage() {
+    cat <<EOF
+mypkg - gerenciador de pacotes source-based
+
+Uso: mypkg <comando> [opções] [args]
+
+Comandos principais:
+  build <pkg>        Compila sem instalar
+  install <pkg>      Compila e instala
+  bin <pkg>          Gera pacote binário
+  remove <pkg>       Remove pacote instalado
+  upgrade [pkg|--all] Atualiza pacotes (major only)
+  sync               Sincroniza índice
+  search <termo>     Busca pacotes
+  info <pkg>         Mostra informações
+  world [--rebuild]  Recompila todo o sistema
+  orphans [--remove] Gerencia órfãos
+  rollback <pkg>     Volta para versão anterior
+  reinstall <pkg>    Reinstala versão atual
+  clean [--all|pkg]  Limpa diretórios/cache
+
+Flags globais:
+  -h, --help         Ajuda
+  -i, --interactive  Confirmações
+  --color=auto|always|never
+  --spinner          Mostra spinner
+  --force            Força operação
+  --verbose          Verbose
+  --quiet            Saída mínima
+EOF
+}
+
+### Parser de flags globais
+parse_global_flags() {
+    FORCE=0 INTERACTIVE=0 VERBOSE=0 QUIET=0 SPINNER=0 COLOR=auto
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -i|--interactive) INTERACTIVE=1 ;;
+            --force) FORCE=1 ;;
+            --verbose) VERBOSE=1 ;;
+            --quiet) QUIET=1 ;;
+            --spinner) SPINNER=1 ;;
+            --color=*) COLOR="${1#*=}" ;;
+            --) shift; break ;;
+            -*) warn \"Flag desconhecida: $1\" ;;
+            *) break ;;
+        esac
+        shift
+    done
+    GLOBAL_ARGS=\"$@\"
+}
+### === DB & Estado ===
+
+db_pkg_dir() { printf '%s/packages/%s' "$MYPKG_DB_DIR" "$1"; }
+db_pkg_file() { printf '%s/%s' "$(db_pkg_dir "$1")" "$2"; }
+
+db_installed_version() {
+    PKG="$1"
+    f="$(db_pkg_file "$PKG" installed)"
+    [ -s "$f" ] && sed -n 's/^version=//p' "$f" || :
+}
+
+db_write_installed() {
+    PKG="$1"; VER="$2"; REL="${3:-1}"; ORIGIN="${4:-local}"
+    d="$(db_pkg_dir "$PKG")"; mkdir -p "$d"
+    {
+        echo "name=$PKG"
+        echo "version=$VER"
+        echo "release=$REL"
+        echo "origin=$ORIGIN"
+        date -u +"installed=%Y-%m-%dT%H:%M:%SZ"
+    } > "$d/installed.new"
+    mv -f "$d/installed.new" "$d/installed"
+}
+
+db_write_files_manifest() { # args: pkg manifest_file
+    PKG="$1"; MAN="$2"; d="$(db_pkg_dir "$PKG")"; mkdir -p "$d"
+    sort "$MAN" > "$d/files.new"
+    mv -f "$d/files.new" "$d/files"
+}
+
+db_get_files_manifest() {
+    PKG="$1"; f="$(db_pkg_file "$PKG" files)"
+    [ -s "$f" ] && cat "$f" || :
+}
+
+db_write_deps() { # pkg dep_list_file
+    PKG="$1"; LIST="$2"; d="$(db_pkg_dir "$PKG")"; mkdir -p "$d"
+    sort -u "$LIST" > "$d/deps.new"
+    mv -f "$d/deps.new" "$d/deps"
+}
+
+db_read_deps() { # pkg
+    PKG="$1"; f="$(db_pkg_file "$PKG" deps)"; [ -s "$f" ] && cat "$f" || :
+}
+
+db_world_file() { printf '%s/world' "$MYPKG_STATE_DIR"; }
+db_add_world() { PKG="$1"; f="$(db_world_file)"; mkdir -p "$MYPKG_STATE_DIR"; touch "$f"; grep -qx "$PKG" "$f" 2>/dev/null || echo "$PKG" >> "$f"; }
+db_list_world() { f="$(db_world_file)"; [ -s "$f" ] && cat "$f" || :; }
+
+db_history_dir() { printf '%s/history/%s' "$MYPKG_DB_DIR" "$1"; }
+db_push_history() { # pkg ver manifest pkgfile
+    PKG="$1"; VER="$2"; MAN="$3"; PKGFILE="$4"
+    d="$(db_history_dir "$PKG")/$VER"; mkdir -p "$d"
+    [ -f "$MAN" ] && cp -f "$MAN" "$d/files.manifest" || :
+    [ -f "$PKGFILE" ] && cp -f "$PKGFILE" "$d/$(basename "$PKGFILE")" || :
+}
+
+### === Versões (SemVer simplificado) ===
+
+semver_major() { echo "$1" | awk -F. '{print $1+0}'; }
+semver_cmp_major() { # returns: 0 eq, 1 greater, 2 less (major only)
+    a="$(semver_major "$1")"; b="$(semver_major "$2")"
+    [ "$a" -gt "$b" ] && { echo 1; return; }
+    [ "$a" -lt "$b" ] && { echo 2; return; }
+    echo 0
+}
+
+### === Locks simples ===
+lock_file() { printf '%s/lock_%s' "$MYPKG_STATE_DIR" "$1"; }
+with_lock() { # name command...
+    L="$(lock_file "$1")"; mkdir -p "$MYPKG_STATE_DIR"
+    exec 9>"$L"
+    if flock 9; then
+        shift
+        "$@"
+        flock -u 9
+    else
+        error "não foi possível obter lock $L"
+    fi
+}
+### === Localização do pacote na árvore /base ===
+# Estrutura esperada: /base/<categoria>/<nome>/{build,version,name,source,depends,patch/,hooks/}
+
+BASE_TREE="${BASE_TREE:-/base}"
+
+pkg_dir() { # retorna caminho do diretório do pacote (primeiro match)
+    # procura por */<pkg> exatamente
+    PKG="$1"
+    find "$BASE_TREE" -type d -name "$PKG" -mindepth 2 -maxdepth 2 2>/dev/null | head -n1
+}
+
+require_pkg_dir() {
+    d="$(pkg_dir "$1")" || :
+    [ -n "${d:-}" ] && echo "$d" && return 0
+    error "pacote '$1' não encontrado em $BASE_TREE"
+}
+
+pkg_read_file() { # pkg filename
+    d="$(require_pkg_dir "$1")" || exit 1
+    [ -f "$d/$2" ] && cat "$d/$2" || :
+}
+
+pkg_version() { pkg_read_file "$1" version | head -n1 | tr -d ' \t\r'; }
+pkg_name()    { n="$(pkg_read_file "$1" name | head -n1 | tr -d ' \t\r')"; [ -n "$n" ] && echo "$n" || echo "$1"; }
+pkg_sources() { pkg_read_file "$1" source | sed -e 's/#.*$//' -e '/^[[:space:]]*$/d'; }
+pkg_depends() { pkg_read_file "$1" depends | sed -e 's/#.*$//' -e '/^[[:space:]]*$/d'; }
+pkg_build_kv() { # lê build, exporta variáveis PKG_* e *_ARGS
+    d="$(require_pkg_dir "$1")"
+    # shellcheck disable=SC2039
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        case "$line" in
+            \#*) continue ;;
+            *=*) eval "$line" ;;
+        esac
+    done < "$d/build"
+}
+
+pkg_patches_dir() { d="$(require_pkg_dir "$1")"; echo "$d/patch"; }
+pkg_hooks_dir()   { d="$(require_pkg_dir "$1")"; echo "$d/hooks"; }
+
+run_hook() { # pkg hookname
+    PKG="$1"; HOOK="$2"; h="$(pkg_hooks_dir "$PKG")/$HOOK"
+    [ -x "$h" ] && { info "hook: $HOOK"; ( sh "$h" ) || error "hook $HOOK falhou"; } || :
+}
+### === Download ===
+fetch_url() { # url outpath
+    url="$1"; out="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -L -o "$out" "$url"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$out" "$url"
+    else
+        error "nem curl nem wget encontrados"
+    fi
+}
+
+fetch_git() { # repo dest ref(optional)
+    repo="$1"; dest="$2"; ref="$3"
+    if [ -d "$dest/.git" ]; then
+        (cd "$dest" && git fetch --all --tags)
+    else
+        git clone --recursive "$repo" "$dest"
+    fi
+    [ -n "$ref" ] && { (cd "$dest" && git checkout "$ref"); }
+}
+
+sha256_calc() { # file
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        error "nenhuma ferramenta sha256 encontrada"
+    fi
+}
+
+### === Extração automática ===
+extract_archive() { # archive dest
+    arc="$1"; dest="$2"; mkdir -p "$dest"
+    case "$arc" in
+        *.tar)      tar -xf "$arc" -C "$dest" ;;
+        *.tar.gz|*.tgz) tar -xzf "$arc" -C "$dest" ;;
+        *.tar.bz2)  tar -xjf "$arc" -C "$dest" ;;
+        *.tar.xz)   tar -xJf "$arc" -C "$dest" ;;
+        *.tar.zst)  tar --use-compress-program zstd -xf "$arc" -C "$dest" ;;
+        *.zip)      unzip -q "$arc" -d "$dest" ;;
+        *.xz)       mkdir -p "$dest" && xz -dkc "$arc" > "$dest/$(basename "${arc%.xz}")" ;;
+        *.gz)       mkdir -p "$dest" && gzip -dkc "$arc" > "$dest/$(basename "${arc%.gz}")" ;;
+        *.bz2)      mkdir -p "$dest" && bzip2 -dkc "$arc" > "$dest/$(basename "${arc%.bz2}")" ;;
+        *)          error "formato não suportado: $arc" ;;
+    esac
+}
+
+### === Baixar fontes listadas em 'source' ===
+# Formato: 
+#   url https://.../foo.tar.xz [sha256=<hash>]
+#   git https://.../repo.git[#tag=v1.2.3|#commit=<sha>]
+download_sources() { # pkg workdir srcdir
+    PKG="$1"; WORK="$2"; SRCCACHE="$MYPKG_CACHE_SRC/$PKG"
+    mkdir -p "$SRCCACHE" "$WORK/src"
+    run_hook "$PKG" pre-download
+    i=0
+    pkg_sources "$PKG" | while IFS= read -r line; do
+        set -- $line
+        typ="$1"; src="$2"; shift 2 || :
+        case "$typ" in
+            url)
+                i=$((i+1))
+                file="$SRCCACHE/src_$i"
+                fetch_url "$src" "$file"
+                # se sha256= for fornecido, verifica
+                for a in "$@"; do
+                    case "$a" in
+                        sha256=*)
+                            want="${a#sha256=}"
+                            got="$(sha256_calc "$file")"
+                            [ "$got" = "$want" ] || error "sha256 inválido (got $got want $want)"
+                            ;;
+                    esac
+                done
+                cp -f "$file" "$WORK/downloads/$(basename "$src" || echo "src_$i")" 2>/dev/null || :
+                echo "$file"
+                ;;
+            git)
+                ref=""
+                case "$src" in
+                    *\#tag=*) ref="${src#*#tag=}"; src="${src%%#tag=*}" ;;
+                    *\#commit=*) ref="${src#*#commit=}"; src="${src%%#commit=*}" ;;
+                esac
+                dest="$SRCCACHE/git"
+                fetch_git "$src" "$dest" "$ref"
+                echo "GIT:$dest"
+                ;;
+            *)
+                error "tipo de source desconhecido: $typ"
+                ;;
+        esac
+    done
+    run_hook "$PKG" post-download
+}
+
+### === Preparar árvore de trabalho e extrair ===
+prepare_workdir() { # pkg version
+    PKG="$1"; VER="$2"
+    W="$MYPKG_BUILD_DIR/${PKG}-${VER}/work"
+    [ -d "$W" ] && rm -rf "$W"
+    mkdir -p "$W" "$W/src" "$W/build" "$W/dest" "$W/downloads"
+    echo "$W"
+}
+
+extract_all() { # pkg workdir
+    PKG="$1"; WORK="$2"
+    run_hook "$PKG" pre-extract
+    # baixar fontes: para simplificar, reaproveitamos o cache já copiado
+    # mas aqui vamos extrair todos os arquivos do cache do pacote
+    for f in "$MYPKG_CACHE_SRC/$PKG"/src_* 2>/dev/null; do
+        [ -f "$f" ] || continue
+        extract_archive "$f" "$WORK/src"
+    done
+    # se houver GIT no cache
+    if [ -d "$MYPKG_CACHE_SRC/$PKG/git/.git" ]; then
+        cp -a "$MYPKG_CACHE_SRC/$PKG/git" "$WORK/src/git"
+    fi
+    run_hook "$PKG" post-extract
+}
+
+### === Aplicar patches ===
+apply_patches() { # pkg workdir
+    PKG="$1"; WORK="$2"
+    pdir="$(pkg_patches_dir "$PKG")"
+    [ -d "$pdir" ] || return 0
+    STRIP="${PATCH_STRIP:-1}"
+    find "$pdir" -type f -name '*.patch' | sort | while IFS= read -r p; do
+        info "aplicando patch $(basename "$p")"
+        (cd "$WORK/src" && patch -p"$STRIP" < "$p") || error "falha ao aplicar patch $p"
+    done
+}
+### === Dependências ===
+# Formato 'depends' por linha: "tipo nome [op operador versao]"
+# Ex.: "build make >= 4.3" / "runtime zlib >= 1.2.13"
+
+dep_list_pkg_names() { # filtra só nomes (build+runtime)
+    pkg="$1"
+    pkg_depends "$pkg" | awk '
+        NF>=2 && ($1=="build"||$1=="runtime") {print $2}
+    ' | sort -u
+}
+
+# Ordenação topológica simples baseada na árvore /base:
+toposort_pkgs() { # recebe lista de pkgs no stdin
+    # Algoritmo Kahn simplificado usando arquivos temporários
+    tmpdir="$(mktemp -d)"; trap 'rm -rf "$tmpdir"' EXIT
+    echo >"$tmpdir/edges"
+    pkgs="$(cat)"
+    # construir arestas: pkg -> deps
+    for p in $pkgs; do
+        for d in $(dep_list_pkg_names "$p"); do
+            echo "$p $d" >>"$tmpdir/edges"
+            echo "$d" >>"$tmpdir/all"
+        done
+        echo "$p" >>"$tmpdir/all"
+    done
+    sort -u "$tmpdir/all" > "$tmpdir/nodes"
+
+    # indegree
+    while read -r n; do
+        indeg=$(awk -v x="$n" '$2==x{c++} END{print c+0}' "$tmpdir/edges")
+        echo "$n $indeg"
+    done < "$tmpdir/nodes" > "$tmpdir/indeg"
+
+    queue="$(awk '$2==0{print $1}' "$tmpdir/indeg")"
+    out=""
+    while [ -n "$queue" ]; do
+        n="${queue%% *}"; queue="${queue#* }"
+        out="$out $n"
+        # remover arestas n->m
+        awk -v x="$n" '$1!=x' "$tmpdir/edges" > "$tmpdir/edges.new" && mv "$tmpdir/edges.new" "$tmpdir/edges"
+        # atualizar indegree e enfileirar os que zeraram
+        while read -r m _; do
+            :
+        done < /dev/null
+        for m in $(awk '{print $1;print $2}' "$tmpdir/edges" | sort -u); do
+            indeg=$(awk -v x="$m" '$2==x{c++} END{print c+0}' "$tmpdir/edges")
+            if [ "$indeg" -eq 0 ] && ! echo " $out $queue " | grep -q " $m "; then
+                queue="$queue $m"
+            fi
+        done
+        queue="$(echo "$queue" | sed -e 's/^ *//' -e 's/  */ /g')"
+    done
+
+    # verificar ciclos
+    edges_left=$(wc -l < "$tmpdir/edges")
+    if [ "$edges_left" -gt 0 ]; then
+        error "ciclo de dependências detectado"
+    fi
+
+    echo "$out" | tr ' ' '\n' | sed '/^$/d'
+}
+### === Build ===
+pkg_configure() { # PKG WORK
+    PKG="$1"; WORK="$2"
+    : "${CONFIGURE_ARGS:=}"
+    # heurística: se houver ./configure
+    srcdir="$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [ -d "$srcdir" ] || srcdir="$WORK/src"
+    if [ -x "$srcdir/configure" ]; then
+        (cd "$srcdir" && sh ./configure --prefix=/usr $CONFIGURE_ARGS)
+    fi
+}
+
+pkg_make() { # PKG WORK
+    PKG="$1"; WORK="$2"
+    : "${MAKE_ARGS:=}"
+    srcdir="$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [ -d "$srcdir" ] || srcdir="$WORK/src"
+    (cd "$srcdir" && make ${MAKEFLAGS:-} $MAKE_ARGS)
+}
+
+pkg_check() { # PKG WORK
+    PKG="$1"; WORK="$2"
+    srcdir="$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [ -d "$srcdir" ] || srcdir="$WORK/src"
+    (cd "$srcdir" && make -n test >/dev/null 2>&1) && (cd "$srcdir" && make test) || :
+}
+
+pkg_install_destdir() { # PKG WORK
+    PKG="$1"; WORK="$2"
+    : "${MAKE_INSTALL_ARGS:=install}"
+    srcdir="$(find "$WORK/src" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [ -d "$srcdir" ] || srcdir="$WORK/src"
+    DEST="$WORK/dest"
+    mkdir -p "$DEST"
+    if command -v fakeroot >/dev/null 2>&1 && [ "${FAKEROOT_ENABLE:-yes}" = "yes" ]; then
+        (cd "$srcdir" && fakeroot make DESTDIR="$DEST" $MAKE_INSTALL_ARGS)
+    else
+        (cd "$srcdir" && make DESTDIR="$DEST" $MAKE_INSTALL_ARGS)
+    fi
+}
+
+make_pkg_archive() { # PKG VER WORK -> pkgfile
+    PKG="$1"; VER="$2"; WORK="$3"
+    DEST="$WORK/dest"
+    [ -d "$DEST" ] || error "DEST ausente para empacotar"
+    out="$MYPKG_CACHE_PKG/${PKG}-${VER}.pkg.tar.zst"
+    (cd "$DEST" && tar --sort=name --numeric-owner --owner=0 --group=0 -c . | zstd -19 -T0 > "$out")
+    echo "$out"
+}
+
+cmd_build() { # build <pkg>
+    pkg="$1"
+    ver="$(pkg_version "$pkg")"; [ -n "$ver" ] || error "version ausente"
+    pkg_build_kv "$pkg" # carrega PKG_*, *_ARGS, etc.
+
+    WORK="$(prepare_workdir "$pkg" "$ver")"
+    run_hook "$pkg" pre-build
+    download_sources "$pkg" "$WORK" # popula cache e downloads
+    extract_all "$pkg" "$WORK"
+    apply_patches "$pkg" "$WORK"
+    pkg_configure "$pkg" "$WORK"
+    pkg_make "$pkg" "$WORK"
+    pkg_check "$pkg" "$WORK"
+    # NÃO instala no sistema
+    info "build concluído para $pkg-$ver (sem instalar)"
+    run_hook "$pkg" post-build
+}
+### === Install & Bin ===
+cmd_bin() { # bin <pkg>
+    pkg="$1"; ver="$(pkg_version "$pkg")"; pkg_build_kv "$pkg"
+    WORK="$(prepare_workdir "$pkg" "$ver")"
+    download_sources "$pkg" "$WORK"; extract_all "$pkg" "$WORK"; apply_patches "$pkg" "$WORK"
+    pkg_configure "$pkg" "$WORK"; pkg_make "$pkg" "$WORK"; pkg_check "$pkg" "$WORK"
+    pkg_install_destdir "$pkg" "$WORK"
+    pkgfile="$(make_pkg_archive "$pkg" "$ver" "$WORK")"
+    info "pacote gerado: $pkgfile"
+}
+
+install_pkgfile_into_root() { # pkgfile root
+    pkgfile="$1"; root="${2:-$MYPKG_ROOT}"
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    (cd "$tmp" && zstd -dc "$pkgfile" | tar -x)
+    # registrar manifest e copiar
+    man="$(mktemp)"; : > "$man"
+    (cd "$tmp" && find . -type f -o -type l -o -type d | sed 's#^\./##' | sort) > "$man"
+    (cd "$tmp" && tar -cf - .) | (cd "$root" && tar -xf -)
+    # devolver manifest
+    echo "$man"
+}
+
+cmd_install() { # install <pkg>
+    pkg="$1"; ver="$(pkg_version "$pkg")"; pkg_build_kv "$pkg"
+    # resolver deps (simplificado: compila e instala deps primeiro)
+    deps="$(dep_list_pkg_names "$pkg")"
+    [ -n "$deps" ] && for d in $(echo "$deps" | toposort_pkgs); do
+        [ -n "$(db_installed_version "$d")" ] || { info "instalando dependência $d"; cmd_install "$d"; }
+    done
+    # gerar binário se necessário e instalar
+    WORK="$(prepare_workdir "$pkg" "$ver")"
+    download_sources "$pkg" "$WORK"; extract_all "$pkg" "$WORK"; apply_patches "$pkg" "$WORK"
+    pkg_configure "$pkg" "$WORK"; pkg_make "$pkg" "$WORK"; pkg_check "$pkg" "$WORK"; pkg_install_destdir "$pkg" "$WORK"
+    pkgfile="$(make_pkg_archive "$pkg" "$ver" "$WORK")"
+    man="$(install_pkgfile_into_root "$pkgfile" "$MYPKG_ROOT")"
+    db_write_files_manifest "$pkg" "$man"
+    db_write_installed "$pkg" "$ver" 1 "source"
+    db_add_world "$pkg"
+    db_write_deps "$pkg" "$(mktemp -u)"
+    info "instalado $pkg-$ver"
+}
+
+### === Remoção ===
+cmd_remove() { # remove <pkg>
+    pkg="$1"
+    [ -n "$(db_installed_version "$pkg")" ] || { warn "$pkg não está instalado"; return 0; }
+    man="$(db_get_files_manifest "$pkg")"
+    [ -n "$man" ] || error "manifest ausente para $pkg"
+    echo "$man" | while IFS= read -r f; do
+        # preservar configs modificadas: heurística simples .conf
+        case "$f" in
+            etc/*/*.conf) [ -f "$MYPKG_ROOT/$f" ] && continue ;;
+        esac
+        rm -rf "$MYPKG_ROOT/$f" 2>/dev/null || :
+    done
+    rm -rf "$(db_pkg_dir "$pkg")"
+    info "removido $pkg"
+}
+
+### === Órfãos ===
+list_installed() { find "$MYPKG_DB_DIR/packages" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | xargs -r -n1 basename; }
+
+cmd_orphans() { # orphans [--remove]
+    ACTION="list"
+    [ "${1:-}" = "--remove" ] && ACTION="remove"
+    world="$(db_list_world | tr '\n' ' ')"
+    installed="$(list_installed)"
+    for p in $installed; do
+        # pacote é órfão se não está em world e ninguém depende dele
+        if ! printf '%s\n' $world | grep -qx "$p"; then
+            # verificar se algum pacote instalado tem $p em deps
+            used=0
+            for q in $installed; do
+                [ "$q" = "$p" ] && continue
+                db_read_deps "$q" | grep -qx "$p" && { used=1; break; }
+            done
+            if [ $used -eq 0 ]; then
+                if [ "$ACTION" = "remove" ]; then
+                    cmd_remove "$p"
+                else
+                    echo "$p"
+                fi
+            fi
+        fi
+    done
+}
+### === Sync & Índice ===
+# Índice simples em texto: "name<TAB>version<TAB>summary<TAB>url"
+INDEX_FILE="$MYPKG_DB_DIR/index"
+
+cmd_sync() {
+    # gera índice local a partir da árvore BASE_TREE
+    mkdir -p "$(dirname "$INDEX_FILE")"
+    : > "$INDEX_FILE"
+    find "$BASE_TREE" -mindepth 2 -maxdepth 2 -type d | while IFS= read -r d; do
+        name="$(basename "$d")"
+        ver="$(sed -n '1p' "$d/version" 2>/dev/null | tr -d ' \t\r')"
+        sum="$(sed -n 's/^PKG_DESC=//p' "$d/build" 2>/dev/null | head -n1 | sed 's/^"//;s/"$//')"
+        url="$(sed -n 's/^PKG_URL=//p' "$d/build" 2>/dev/null | head -n1 | sed 's/^"//;s/"$//')"
+        [ -n "$name" ] && [ -n "$ver" ] && printf '%s\t%s\t%s\t%s\n' "$name" "$ver" "$sum" "$url" >> "$INDEX_FILE"
+    done
+    info "sync concluído: $(wc -l < "$INDEX_FILE") pacotes indexados"
+}
+
+cmd_search() { # search termo
+    t="${1:-}"; [ -s "$INDEX_FILE" ] || cmd_sync
+    awk -F'\t' -v q="$t" 'tolower($1) ~ tolower(q) || tolower($3) ~ tolower(q) {printf "%-20s %s\t%s\n",$1,$2,$3}' "$INDEX_FILE"
+}
+
+cmd_info() { # info pkg
+    p="$1"; [ -s "$INDEX_FILE" ] || cmd_sync
+    echo "== Pacote: $p =="
+    awk -F'\t' -v x="$p" '$1==x{print "Disponível:",$2; print "Resumo:",$3; print "URL:",$4}' "$INDEX_FILE"
+    inst="$(db_installed_version "$p")"
+    [ -n "$inst" ] && echo "Instalado: $inst" || echo "Instalado: (não)"
+    echo "-- Arquivos (se instalado) --"
+    db_get_files_manifest "$p" 2>/dev/null || :
+    echo "-- Dependências (árvore declarada) --"
+    pkg_depends "$p" 2>/dev/null || :
+}
+### === Upgrade (major-only) ===
+cmd_upgrade_one() { # pkg
+    p="$1"
+    cur="$(db_installed_version "$p")"
+    avail="$(pkg_version "$p")"
+    [ -z "$avail" ] && error "sem versão disponível para $p"
+    if [ -z "$cur" ]; then
+        info "$p não instalado, instalando"
+        cmd_install "$p"
+        return
+    fi
+    cmp="$(semver_cmp_major "$avail" "$cur")"
+    case "$cmp" in
+        1) info "upgrade major $p: $cur -> $avail"; # salvar histórico
+           # gerar pacote atual para rollback
+           # (heurística: não recompila, apenas guarda manifest + placeholder)
+           manfile="$(mktemp)"; db_get_files_manifest "$p" > "$manfile"
+           db_push_history "$p" "$cur" "$manfile" ""
+           cmd_install "$p"
+           ;;
+        0|2) info "sem upgrade major para $p (instalado $cur, disponível $avail)" ;;
+    esac
+}
+
+cmd_upgrade() { # upgrade [pkg|--all]
+    if [ "${1:-}" = "--all" ] || [ $# -eq 0 ]; then
+        # todos instalados ou do índice
+        [ -s "$INDEX_FILE" ] || cmd_sync
+        awk -F'\t' '{print $1}' "$INDEX_FILE" | while IFS= read -r p; do
+            cmd_upgrade_one "$p"
+        done
+    else
+        cmd_upgrade_one "$1"
+    fi
+}
+
+### === Rollback & Reinstall ===
+cmd_reinstall() { # reinstall pkg
+    p="$1"; cur="$(db_installed_version "$p")"
+    [ -n "$cur" ] || error "$p não está instalado"
+    info "reinstalando $p-$cur"
+    cmd_install "$p"
+}
+
+cmd_rollback() { # rollback pkg|--all
+    if [ "${1:-}" = "--all" ]; then
+        # percorre histórico e tenta restaurar versões anteriores (best effort)
+        for d in "$MYPKG_DB_DIR/history"/* 2>/dev/null; do
+            [ -d "$d" ] || continue
+            p="$(basename "$d")"
+            last="$(ls -1 "$d" | sort -r | sed -n '2p')" # pega a penúltima (anterior)
+            [ -n "$last" ] || { warn "sem histórico anterior para $p"; continue; }
+            info "rollback $p -> $last"
+            # tenta instalar versão disponível na árvore se coincidir
+            if [ "$(pkg_version "$p")" = "$last" ]; then
+                cmd_install "$p"
+            else
+                warn "versão $last não disponível na árvore; necessário manter cache binário (não implementado aqui)"
+            fi
+        done
+        return
+    fi
+    p="$1"; cur="$(db_installed_version "$p")"
+    [ -n "$cur" ] || error "$p não está instalado"
+    prev="$(ls -1 "$(db_history_dir "$p")" 2>/dev/null | sort -r | sed -n '1p')"
+    [ -n "$prev" ] || error "sem histórico para rollback de $p"
+    if [ "$(pkg_version "$p")" = "$prev" ]; then
+        info "instalando versão anterior $p-$prev"
+        cmd_install "$p"
+    else
+        warn "versão $prev não disponível na árvore; rollback requer binário em cache (não implementado aqui)"
+    fi
+}
+### === World ===
+cmd_world() { # world [--rebuild]
+    if [ "${1:-}" = "--rebuild" ]; then
+        pkgs="$(db_list_world)"
+        [ -n "$pkgs" ] || { warn "world vazio"; return 0; }
+        echo "$pkgs" | toposort_pkgs | while IFS= read -r p; do
+            info "rebuild $p"
+            cmd_install "$p"
+        done
+    else
+        db_list_world
+    fi
+}
+
+### === Check ===
+cmd_check() { # check pkg
+    p="$1"
+    man="$(db_get_files_manifest "$p")"
+    [ -n "$man" ] || { warn "sem manifest para $p"; return 0; }
+    missing=0
+    echo "$man" | while IFS= read -r f; do
+        [ -e "$MYPKG_ROOT/$f" ] || { echo "MISSING $f"; missing=1; }
+    done
+    return $missing
+}
+
+### === Clean ===
+cmd_clean() { # clean [--all|pkg]
+    case "${1:-}" in
+        --all) rm -rf "$MYPKG_BUILD_DIR" "$MYPKG_CACHE_SRC" "$MYPKG_CACHE_PKG"; mkdir -p "$MYPKG_BUILD_DIR" "$MYPKG_CACHE_SRC" "$MYPKG_CACHE_PKG";;
+        "") rm -rf "$MYPKG_BUILD_DIR"; mkdir -p "$MYPKG_BUILD_DIR";;
+        *) pkg="$1"; rm -rf "$MYPKG_BUILD_DIR/${pkg}-"* ;;
+    esac
+    info "clean concluído"
+}
+
+### === Parser principal e dispatcher ===
+main() {
+    init_dirs
+    [ $# -lt 1 ] && { usage; exit 1; }
+    cmd="$1"; shift || :
+    parse_global_flags "$@"
+    # reparse args remanescentes no GLOBAL_ARGS
+    set -- $GLOBAL_ARGS
+
+    case "$cmd" in
+        build)   [ $# -ge 1 ] || error "uso: mypkg build <pkg>";   cmd_build "$1" ;;
+        bin)     [ $# -ge 1 ] || error "uso: mypkg bin <pkg>";     cmd_bin "$1" ;;
+        install) [ $# -ge 1 ] || error "uso: mypkg install <pkg>"; cmd_install "$1" ;;
+        remove)  [ $# -ge 1 ] || error "uso: mypkg remove <pkg>";  cmd_remove "$1" ;;
+        upgrade) cmd_upgrade "$@" ;;
+        sync)    cmd_sync ;;
+        search)  [ $# -ge 1 ] || error "uso: mypkg search <termo>"; cmd_search "$1" ;;
+        info)    [ $# -ge 1 ] || error "uso: mypkg info <pkg>";     cmd_info "$1" ;;
+        world)   cmd_world "$@" ;;
+        orphans) cmd_orphans "$@" ;;
+        check)   [ $# -ge 1 ] || error "uso: mypkg check <pkg>";    cmd_check "$1" ;;
+        rollback) [ $# -ge 1 ] || error "uso: mypkg rollback <pkg|--all>"; cmd_rollback "$1" ;;
+        reinstall) [ $# -ge 1 ] || error "uso: mypkg reinstall <pkg>"; cmd_reinstall "$1" ;;
+        clean)   cmd_clean "$@" ;;
+        *) usage; error "comando desconhecido: $cmd" ;;
+    esac
+}
+
+main "$@"
