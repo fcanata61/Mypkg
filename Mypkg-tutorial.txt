@@ -1,0 +1,152 @@
+=====================================================================
+                          MYPKG - TUTORIAL COMPLETO
+=====================================================================
+
+1. SOBRE O MYPKG
+----------------
+mypkg é um gerenciador de pacotes source-based simples, estável e 100% funcional
+em POSIX sh. Ele permite baixar, compilar, instalar e gerenciar pacotes de forma
+automática, incluindo dependências, órfãos, logs, patches e mais.
+
+Funcionalidades:
+- Build, install, remove, upgrade, sync
+- Resolução de dependências recursiva
+- World rebuild (recompila todo o sistema)
+- Download via curl, wget, git
+- Suporte a patches
+- Logs detalhados
+- Sha256sum e verificação
+- Clean de diretório de trabalho
+- Destdir e fakeroot
+- Flags coloridas, help, spinner, etc.
+
+---------------------------------------------------------------------
+2. ÁRVORE DE DIRETÓRIOS
+------------------------
+/etc/mypkg/
+    mypkg.conf              # configuração global
+/var/lib/mypkg/
+    db/                     # banco de dados de pacotes instalados
+    state/                  # estado de builds
+    cache/
+        src/                # arquivos fonte
+        pkg/                # pacotes prontos
+    build/                  # diretório de build temporário
+/var/log/mypkg/             # logs do mypkg
+~/.config/mypkg/
+    mypkg.conf              # configuração do usuário (opcional)
+~/mypkg-recipes/             # receitas de pacotes (pkgname.sh)
+
+---------------------------------------------------------------------
+3. INSTALAÇÃO
+----------------
+1. Clonar o repositório ou baixar o script mypkg:
+    $ git clone https://seurepo/mypkg.git
+    $ cd mypkg
+2. Instalar o script em /usr/local/bin:
+    $ sudo cp mypkg /usr/local/bin/
+    $ sudo chmod +x /usr/local/bin/mypkg
+3. Criar diretórios necessários:
+    $ sudo mkdir -p /var/lib/mypkg/{db,state,cache/src,cache/pkg,build}
+    $ sudo mkdir -p /var/log/mypkg
+    $ sudo mkdir -p /etc/mypkg
+4. Copiar configuração padrão:
+    $ sudo cp mypkg.conf /etc/mypkg/mypkg.conf
+5. Opcional: criar configuração do usuário:
+    $ mkdir -p ~/.config/mypkg
+    $ cp /etc/mypkg/mypkg.conf ~/.config/mypkg/mypkg.conf
+
+---------------------------------------------------------------------
+4. CONFIGURAÇÃO
+----------------
+Editar `/etc/mypkg/mypkg.conf` para ajustar:
+- MYPKG_ROOT, MYPKG_DB_DIR, MYPKG_BUILD_DIR, MYPKG_CACHE_SRC, etc.
+- Ferramentas externas (curl, wget, git, tar)
+- CFLAGS, CXXFLAGS, MAKEFLAGS
+- Logs e cores
+- Política de upgrade (major-only ou all)
+
+---------------------------------------------------------------------
+5. COMANDOS PRINCIPAIS
+----------------------
+1. Instalar pacote:
+    $ mypkg -i <pkgname>
+    - Resolve dependências
+    - Baixa, descompacta, aplica patch, compila e instala
+2. Build somente (não instala):
+    $ mypkg build <pkgname>
+3. Upgrade:
+    $ mypkg upgrade <pkgname>
+    - Segue política de upgrade
+4. Remover:
+    $ mypkg remove <pkgname>
+    - Remove e verifica órfãos
+5. Sincronizar com repositório:
+    $ mypkg sync
+6. Listar pacotes instalados:
+    $ mypkg list
+7. Procurar pacote:
+    $ mypkg search <nome>
+8. Mostrar informações do pacote:
+    $ mypkg info <pkgname>
+9. Recompilar tudo (world):
+    $ mypkg world --rebuild
+10. Listar órfãos:
+    $ mypkg orphans
+11. Clean diretório de build:
+    $ mypkg clean
+12. Ajuda:
+    $ mypkg -h | --help
+
+---------------------------------------------------------------------
+6. RECEITA DE PACOTE: GCC
+--------------------------
+Arquivo de receita: ~/mypkg-recipes/gcc.sh
+
+```sh
+# gcc.sh - mypkg recipe
+
+name="gcc"
+version="13.3.0"
+source="https://ftp.gnu.org/gnu/gcc/gcc-$version/gcc-$version.tar.xz"
+depends="gmp mpfr mpc isl zlib"
+build_dir="$MYPKG_BUILD_DIR/$name"
+patches=()
+hooks=()
+
+do_prepare() {
+    mkdir -p "$build_dir"
+    cd "$build_dir"
+}
+
+do_download() {
+    [ -f "$MYPKG_CACHE_SRC/gcc-$version.tar.xz" ] || \
+    $CMD_WGET "$MYPKG_CACHE_SRC/gcc-$version.tar.xz" "$source"
+}
+
+do_extract() {
+    cd "$build_dir"
+    $CMD_TAR -xf "$MYPKG_CACHE_SRC/gcc-$version.tar.xz"
+}
+
+do_patch() {
+    cd "$build_dir/gcc-$version"
+    for p in "${patches[@]}"; do
+        patch -p1 < "$p"
+    done
+}
+
+do_build() {
+    mkdir -p build && cd build
+    ../gcc-$version/configure \
+        --prefix=/usr \
+        --disable-multilib \
+        --enable-languages=c,c++ \
+        CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS"
+    make $MAKEFLAGS
+}
+
+do_install() {
+    cd "$build_dir/build"
+    make DESTDIR="$MYPKG_ROOT" install
+}
